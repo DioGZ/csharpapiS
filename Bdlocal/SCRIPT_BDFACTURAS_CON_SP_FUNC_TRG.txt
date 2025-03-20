@@ -1,0 +1,448 @@
+-- Desactivar las claves foráneas
+-- Desactiva temporalmente todas las claves foráneas de la base de datos para eliminar las tablas.
+DECLARE @sql NVARCHAR(MAX) = N'';
+SELECT @sql += N'ALTER TABLE ' + QUOTENAME(OBJECT_SCHEMA_NAME(parent_object_id)) + '.' + QUOTENAME(OBJECT_NAME(parent_object_id)) 
+    + ' DROP CONSTRAINT ' + QUOTENAME(name) + ';' + CHAR(13)
+FROM sys.foreign_keys;
+EXEC sp_executesql @sql;
+
+-- Eliminar las tablas
+-- Elimina todas las tablas existentes en la base de datos.
+EXEC sp_MSforeachtable @command1='DROP TABLE ?';
+GO
+
+-- Eliminar función y trigger si existen
+-- Elimina el trigger y la función si ya existen.
+IF OBJECT_ID('calcular_subtotal_y_total_trigger', 'TR') IS NOT NULL
+    DROP TRIGGER calcular_subtotal_y_total_trigger;
+GO
+
+IF OBJECT_ID('calcular_subtotal_y_total', 'IF') IS NOT NULL
+    DROP FUNCTION calcular_subtotal_y_total;
+GO
+
+-- Crear tablas
+-- Crea todas las tablas necesarias para el sistema.
+CREATE TABLE persona
+(
+    codigo VARCHAR(20) NOT NULL,
+    nombre VARCHAR(100) NOT NULL,
+    email VARCHAR(100) NOT NULL,
+    telefono VARCHAR(20) NOT NULL,
+    CONSTRAINT persona_pkey PRIMARY KEY (codigo)
+);
+
+CREATE TABLE vendedor
+(
+    id INT IDENTITY(1,1) NOT NULL,
+    carnet INT NOT NULL,
+    direccion VARCHAR(100) NOT NULL,
+    fkcodpersona VARCHAR(20) UNIQUE NOT NULL,
+    CONSTRAINT vendedor_pkey PRIMARY KEY (id),
+    CONSTRAINT cons_unique_fkcodpersona UNIQUE (fkcodpersona)
+);
+
+CREATE TABLE empresa
+(
+    codigo VARCHAR(10) NOT NULL,
+    nombre VARCHAR(200) NOT NULL,
+    CONSTRAINT empresa_pkey PRIMARY KEY (codigo)
+);
+
+CREATE TABLE cliente
+(
+    id INT IDENTITY(1,1) NOT NULL,
+    credito FLOAT(53) NOT NULL DEFAULT 0,
+    fkcodpersona VARCHAR(20) UNIQUE NOT NULL,
+    fkcodempresa VARCHAR(10),
+    CONSTRAINT cliente_pkey PRIMARY KEY (id),
+    CONSTRAINT cons_unique_fkcodpersona1 UNIQUE (fkcodpersona)
+);
+
+CREATE TABLE factura
+(
+    numero INT IDENTITY(1,1) NOT NULL,
+    fecha DATETIME2 NOT NULL DEFAULT GETDATE(),
+    total FLOAT(53) NOT NULL DEFAULT 0,
+    fkidcliente INT NOT NULL,
+    fkidvendedor INT NOT NULL,
+    CONSTRAINT factura_pkey PRIMARY KEY (numero)
+);
+
+CREATE TABLE producto
+(
+    codigo VARCHAR(30) NOT NULL,
+    nombre VARCHAR(100) NOT NULL,
+    stock INT NOT NULL,
+    valorunitario FLOAT(53) NOT NULL,
+    CONSTRAINT producto_pkey PRIMARY KEY (codigo)
+);
+
+CREATE TABLE productosporfactura
+(
+    fknumfactura INT NOT NULL,
+    fkcodproducto VARCHAR(30) NOT NULL,
+    cantidad INT NOT NULL,
+    subtotal FLOAT(53) NOT NULL DEFAULT 0,
+    CONSTRAINT productosporfactura_pkey PRIMARY KEY (fknumfactura, fkcodproducto)
+);
+
+CREATE TABLE rol
+(
+    id INT IDENTITY(1,1) NOT NULL,
+    nombre VARCHAR(100) NOT NULL,
+    CONSTRAINT rol_pkey PRIMARY KEY (id)
+);
+
+CREATE TABLE rol_usuario
+(
+    fkemail VARCHAR(100) NOT NULL,
+    fkidrol INT NOT NULL,
+    CONSTRAINT rol_usuario_pkey PRIMARY KEY (fkemail, fkidrol)
+);
+
+CREATE TABLE usuario
+(
+    email VARCHAR(100) NOT NULL,
+    contrasena VARCHAR(100) NOT NULL,
+    CONSTRAINT usuario_pkey PRIMARY KEY (email)
+);
+GO
+
+-- Agregar claves foráneas
+-- Agrega las claves foráneas necesarias para las tablas creadas.
+ALTER TABLE cliente
+    ADD CONSTRAINT cons_fkcodempresa FOREIGN KEY (fkcodempresa)
+    REFERENCES empresa (codigo);
+
+ALTER TABLE cliente
+    ADD CONSTRAINT cons_fkcodpersona FOREIGN KEY (fkcodpersona)
+    REFERENCES persona (codigo);
+
+ALTER TABLE factura
+    ADD CONSTRAINT cons_fkidcliente FOREIGN KEY (fkidcliente)
+    REFERENCES cliente (id);
+
+ALTER TABLE factura
+    ADD CONSTRAINT cons_fkidvendedor FOREIGN KEY (fkidvendedor)
+    REFERENCES vendedor (id);
+
+ALTER TABLE productosporfactura
+    ADD CONSTRAINT cons_fkcodproducto FOREIGN KEY (fkcodproducto)
+    REFERENCES producto (codigo);
+
+ALTER TABLE productosporfactura
+    ADD CONSTRAINT cons_fknumfactura FOREIGN KEY (fknumfactura)
+    REFERENCES factura (numero)
+    ON DELETE CASCADE;
+
+ALTER TABLE rol_usuario
+    ADD CONSTRAINT rol_usuario_ibfk_1 FOREIGN KEY (fkemail)
+    REFERENCES usuario (email)
+    ON UPDATE CASCADE
+    ON DELETE CASCADE;
+
+ALTER TABLE rol_usuario
+    ADD CONSTRAINT rol_usuario_ibfk_2 FOREIGN KEY (fkidrol)
+    REFERENCES rol (id);
+
+ALTER TABLE vendedor
+    ADD CONSTRAINT cons_fkcodpersona1 FOREIGN KEY (fkcodpersona)
+    REFERENCES persona (codigo);
+GO
+
+-- Crear función para calcular subtotal y total
+-- Esta función calcula el subtotal de los productos en base a la cantidad y el valor unitario.
+-- Además, verifica si la cantidad solicitada excede el stock disponible del producto.
+CREATE FUNCTION calcular_subtotal_y_total
+(
+    @fknumfactura INT,
+    @fkcodproducto VARCHAR(30),
+    @cantidad INT
+)
+RETURNS TABLE
+AS
+RETURN
+(
+    SELECT 
+        @fknumfactura AS fknumfactura,
+        @fkcodproducto AS fkcodproducto,
+        @cantidad AS cantidad,
+        @cantidad * p.valorunitario AS subtotal,
+        CASE 
+            WHEN @cantidad > p.stock THEN 1  -- Retorna 1 si el stock es insuficiente.
+            ELSE 0  -- Retorna 0 si el stock es suficiente.
+        END AS insuficiente_stock
+    FROM 
+        producto p
+    WHERE 
+        p.codigo = @fkcodproducto
+);
+GO
+
+-- Crear trigger para actualizar subtotal y total
+-- Este trigger se activa después de una inserción en la tabla productosporfactura.
+-- Se encarga de verificar si hay suficiente stock y actualiza el subtotal y total de la factura.
+CREATE TRIGGER calcular_subtotal_y_total_trigger
+ON productosporfactura
+AFTER INSERT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Declara una variable para almacenar si hay stock insuficiente
+    DECLARE @insuficiente_stock BIT;
+
+    -- Verifica si la cantidad insertada excede el stock disponible
+    SELECT @insuficiente_stock = MAX(insuficiente_stock)
+    FROM INSERTED i
+    CROSS APPLY calcular_subtotal_y_total(i.fknumfactura, i.fkcodproducto, i.cantidad);
+
+    -- Si no hay suficiente stock, genera un error y revierte la transacción
+    IF @insuficiente_stock = 1
+    BEGIN
+        RAISERROR ('No hay suficiente existencia de productos en bodega', 16, 1);
+        ROLLBACK TRANSACTION;
+        RETURN;
+    END
+
+    -- Intenta actualizar los subtotales y totales de la factura
+    BEGIN TRY
+        BEGIN TRANSACTION;
+
+        -- Actualiza el subtotal del producto en productosporfactura
+        UPDATE pf
+        SET subtotal = cst.subtotal
+        FROM productosporfactura pf
+        INNER JOIN INSERTED i ON pf.fknumfactura = i.fknumfactura AND pf.fkcodproducto = i.fkcodproducto
+        CROSS APPLY calcular_subtotal_y_total(i.fknumfactura, i.fkcodproducto, i.cantidad) cst;
+
+        -- Actualiza el stock del producto en la tabla producto
+        UPDATE p
+        SET stock = p.stock - i.cantidad
+        FROM producto p
+        INNER JOIN INSERTED i ON p.codigo = i.fkcodproducto;
+
+        -- Actualiza el total de la factura en base a los subtotales
+        UPDATE f
+        SET total = f.total + (SELECT SUM(cst.subtotal)
+                               FROM INSERTED i
+                               CROSS APPLY calcular_subtotal_y_total(i.fknumfactura, i.fkcodproducto, i.cantidad) cst)
+        FROM factura f
+        INNER JOIN INSERTED i ON f.numero = i.fknumfactura;
+
+        -- Confirma la transacción
+        COMMIT TRANSACTION;
+    END TRY
+    -- Si ocurre un error, revierte la transacción y muestra un mensaje
+    BEGIN CATCH
+        ROLLBACK TRANSACTION;
+        DECLARE @ErrorMessage NVARCHAR(4000) = ERROR_MESSAGE();
+        RAISERROR ('Error en el trigger: %s', 16, 1, @ErrorMessage);
+    END CATCH
+END;
+GO
+
+-- Insertar datos de prueba en las tablas
+-- Inserta datos iniciales para las tablas de persona, empresa, vendedor, cliente, y productos.
+INSERT INTO persona (codigo, nombre, email, telefono)
+VALUES 
+('P001', 'Juan Pérez', 'juan.perez@email.com', '555-1234'),
+('P002', 'Ana Gómez', 'ana.gomez@email.com', '555-5678'),
+('P003', 'Carlos Ruiz', 'carlos.ruiz@email.com', '555-8765');
+
+INSERT INTO empresa (codigo, nombre)
+VALUES 
+('E001', 'Empresa ABC'),
+('E002', 'Empresa XYZ');
+
+INSERT INTO vendedor (carnet, direccion, fkcodpersona)
+VALUES 
+(1001, 'Calle 123', 'P001'),
+(1002, 'Avenida 456', 'P002');
+
+INSERT INTO cliente (credito, fkcodpersona, fkcodempresa)
+VALUES 
+(5000.00, 'P003', 'E001'),
+(10000.00, 'P002', 'E002');
+
+INSERT INTO producto (codigo, nombre, stock, valorunitario)
+VALUES 
+('PRD001', 'Producto A', 50, 100.00),
+('PRD002', 'Producto B', 30, 200.00),
+('PRD003', 'Producto C', 20, 150.00),
+('PRD004', 'Producto D', 25, 120.00),
+('PRD005', 'Producto E', 10, 180.00);
+
+INSERT INTO rol (nombre)
+VALUES 
+('Administrador'),
+('Vendedor');
+
+INSERT INTO usuario (email, contrasena)
+VALUES 
+('admin@email.com', 'admin123'),
+('vendedor@email.com', 'vendedor123');
+
+INSERT INTO rol_usuario (fkemail, fkidrol)
+VALUES 
+('admin@email.com', 1),
+('vendedor@email.com', 2);
+GO
+
+-- Eliminar el procedimiento almacenado si ya existe
+-- Verifica si el procedimiento almacenado existe y lo elimina si es necesario.
+IF OBJECT_ID('insertar_factura_y_productos', 'P') IS NOT NULL
+    DROP PROCEDURE insertar_factura_y_productos;
+GO
+
+-- Procedimiento almacenado para insertar factura y productos
+-- Este procedimiento almacenado inserta una nueva factura en la tabla factura.
+-- Luego, inserta los productos asociados a esa factura, actualiza el stock, y calcula el total de la factura.
+CREATE PROCEDURE insertar_factura_y_productos
+    @fkidcliente INT,
+    @fkidvendedor INT,
+    @productos NVARCHAR(MAX) -- JSON que contiene los productos (código y cantidad)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Declara una variable para almacenar el número de la nueva factura
+    DECLARE @nuevoNumeroFactura INT;
+
+    -- Declara una variable para almacenar el total de la factura
+    DECLARE @totalFactura FLOAT(53) = 0;
+
+    -- Inicia un bloque TRY-CATCH para manejar errores
+    BEGIN TRY
+        -- Inicia una transacción
+        BEGIN TRANSACTION;
+
+        -- Inserta una nueva factura
+        INSERT INTO factura (fkidcliente, fkidvendedor)
+        VALUES (@fkidcliente, @fkidvendedor);
+
+        -- Obtiene el número de la nueva factura insertada
+        SET @nuevoNumeroFactura = SCOPE_IDENTITY();
+
+        -- Declara variables para procesar los productos
+        DECLARE @productoId VARCHAR(30);
+        DECLARE @cantidad INT;
+        DECLARE @subtotal FLOAT(53);
+        
+        -- Crea una tabla temporal para almacenar los productos extraídos del JSON
+        DECLARE @TablaProductos TABLE (
+            fkcodproducto VARCHAR(30),
+            cantidad INT
+        );
+
+        -- Inserta los productos del JSON en la tabla temporal
+        INSERT INTO @TablaProductos (fkcodproducto, cantidad)
+        SELECT fkcodproducto, cantidad
+        FROM OPENJSON(@productos)
+        WITH (
+            fkcodproducto VARCHAR(30) '$.fkcodproducto',
+            cantidad INT '$.cantidad'
+        );
+
+        -- Utiliza un cursor para recorrer los productos y procesarlos
+        DECLARE producto_cursor CURSOR FOR
+        SELECT fkcodproducto, cantidad FROM @TablaProductos;
+
+        OPEN producto_cursor;
+
+        FETCH NEXT FROM producto_cursor INTO @productoId, @cantidad;
+
+        -- Procesa cada producto insertado
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            -- Calcula el subtotal del producto
+            SELECT @subtotal = @cantidad * valorunitario
+            FROM producto
+            WHERE codigo = @productoId;
+
+            -- Inserta el producto en productosporfactura
+            INSERT INTO productosporfactura (fknumfactura, fkcodproducto, cantidad, subtotal)
+            VALUES (@nuevoNumeroFactura, @productoId, @cantidad, @subtotal);
+
+            -- Actualiza el stock del producto
+            UPDATE producto
+            SET stock = stock - @cantidad
+            WHERE codigo = @productoId;
+
+            -- Suma el subtotal al total de la factura
+            SET @totalFactura = @totalFactura + @subtotal;
+
+            FETCH NEXT FROM producto_cursor INTO @productoId, @cantidad;
+        END;
+
+        -- Cierra y elimina el cursor
+        CLOSE producto_cursor;
+        DEALLOCATE producto_cursor;
+
+        -- Actualiza el total en la factura
+        UPDATE factura
+        SET total = @totalFactura
+        WHERE numero = @nuevoNumeroFactura;
+
+        -- Confirma la transacción
+        COMMIT TRANSACTION;
+
+        PRINT 'Factura y productos insertados correctamente';
+    END TRY
+    -- En caso de error, revierte la transacción y muestra el error
+    BEGIN CATCH
+        ROLLBACK TRANSACTION;
+        DECLARE @ErrorMessage NVARCHAR(4000) = ERROR_MESSAGE();
+        RAISERROR ('Error al insertar factura y productos: %s', 16, 1, @ErrorMessage);
+    END CATCH
+END;
+GO
+
+-- Llamadas al procedimiento almacenado para insertar 3 facturas con 3 productos cada una
+-- Inserta 3 facturas con 3 productos diferentes por factura utilizando el procedimiento almacenado.
+DECLARE @productos1 NVARCHAR(MAX) = 
+'[{"fkcodproducto": "PRD001", "cantidad": 2},
+  {"fkcodproducto": "PRD002", "cantidad": 1},
+  {"fkcodproducto": "PRD003", "cantidad": 3}]';
+
+DECLARE @productos2 NVARCHAR(MAX) = 
+'[{"fkcodproducto": "PRD002", "cantidad": 2},
+  {"fkcodproducto": "PRD004", "cantidad": 1},
+  {"fkcodproducto": "PRD005", "cantidad": 1}]';
+
+DECLARE @productos3 NVARCHAR(MAX) = 
+'[{"fkcodproducto": "PRD003", "cantidad": 1},
+  {"fkcodproducto": "PRD004", "cantidad": 3},
+  {"fkcodproducto": "PRD005", "cantidad": 2}]';
+
+-- Factura 1
+EXEC insertar_factura_y_productos 
+    @fkidcliente = 1, 
+    @fkidvendedor = 1, 
+    @productos = @productos1;
+
+-- Factura 2
+EXEC insertar_factura_y_productos 
+    @fkidcliente = 2, 
+    @fkidvendedor = 2, 
+    @productos = @productos2;
+
+-- Factura 3
+EXEC insertar_factura_y_productos 
+    @fkidcliente = 1, 
+    @fkidvendedor = 2, 
+    @productos = @productos3;
+GO
+
+CREATE TABLE RutaRol
+(
+    Ruta VARCHAR(4000) NOT NULL,
+    Rol VARCHAR(100) NOT NULL
+);
+GO
+INSERT INTO RutaRol(Ruta,Rol) VALUES('/rol','Administrador');
+INSERT INTO RutaRol(Ruta,Rol) VALUES('/usuario','Administrador');
+INSERT INTO RutaRol(Ruta,Rol) VALUES('/persona','Administrador');
+INSERT INTO RutaRol(Ruta,Rol) VALUES('/vendedor','Vendedor');
+GO
